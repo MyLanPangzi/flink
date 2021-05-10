@@ -24,6 +24,13 @@ import org.apache.flink.metrics.Metric;
 import org.apache.flink.metrics.MetricConfig;
 import org.apache.flink.metrics.reporter.InstantiateViaFactory;
 import org.apache.flink.metrics.reporter.MetricReporter;
+
+import org.apache.flink.shaded.curator4.org.apache.curator.framework.CuratorFramework;
+import org.apache.flink.shaded.curator4.org.apache.curator.framework.CuratorFrameworkFactory;
+import org.apache.flink.shaded.curator4.org.apache.curator.retry.ExponentialBackoffRetry;
+
+import org.apache.flink.shaded.zookeeper3.org.apache.zookeeper.CreateMode;
+
 import org.apache.flink.util.NetUtils;
 import org.apache.flink.util.Preconditions;
 
@@ -37,6 +44,14 @@ import java.util.Iterator;
 @InstantiateViaFactory(
         factoryClassName = "org.apache.flink.metrics.prometheus.PrometheusReporterFactory")
 public class PrometheusReporter extends AbstractPrometheusReporter {
+
+    static final String ZK_SERVERS = "zk.servers";
+    static final String ZK_PATH = "zk.path";
+    static final String DEFAULT_ZK_PATH = "/flink";
+    public static final String ZK_BASE_SLEEP_MS = "zk.base-sleep-ms";
+    public static final int DEFAULT_BASE_SLEEP_MS = 1000;
+    public static final String ZK_MAX_RETRY = "zk.max-retries";
+    public static final int DEFAULT_MAX_RETRIES = 10;
 
     static final String ARG_PORT = "port";
     private static final String DEFAULT_PORT = "9249";
@@ -73,6 +88,38 @@ public class PrometheusReporter extends AbstractPrometheusReporter {
             throw new RuntimeException(
                     "Could not start PrometheusReporter HTTP server on any configured port. Ports: "
                             + portsConfig);
+        }
+        registerZk(config);
+    }
+
+    private void registerZk(MetricConfig config) {
+        if (!config.containsKey(ZK_SERVERS)) {
+            return;
+        }
+        try {
+            ExponentialBackoffRetry retryPolicy = new ExponentialBackoffRetry(
+                    config.getInteger(ZK_BASE_SLEEP_MS, DEFAULT_BASE_SLEEP_MS),
+                    config.getInteger(ZK_MAX_RETRY, DEFAULT_MAX_RETRIES));
+            CuratorFramework client = CuratorFrameworkFactory.builder()
+                .connectString(config.getProperty(ZK_SERVERS))
+                .retryPolicy(retryPolicy)
+                .build();
+            String data = "{\"serviceEndpoint\":{\"host\":\"%s\",\"port\":%s},"
+                    + "\"additionalEndpoints\":{},\"status\":\"ALIVE\"}";
+            String host = new String(CuratorFrameworkFactory.getLocalAddress());
+            String path = String.format("%s/%s:%s",
+                    config.getString(ZK_PATH, DEFAULT_ZK_PATH), host, this.port);
+            String json = String.format(data, host, this.port);
+            log.info("path :{}, json :{}", path, json);
+            client.start();
+            client
+                    .create()
+                    .creatingParentsIfNeeded()
+                    .withMode(CreateMode.EPHEMERAL)
+                    .forPath(path, json.getBytes());
+            log.info("zk register succeed");
+        } catch (Exception e) {
+            log.error("register zk error", e);
         }
     }
 
